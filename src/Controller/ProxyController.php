@@ -17,6 +17,8 @@ class ProxyController extends AbstractController
     private const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
     private const TIMEOUT_SECONDS = 15.0;
     private const FORBIDDEN_REQUEST_HEADERS = ['host', 'content-length', 'connection'];
+    private const ALLOWED_ORIGINS = ['https://validformat.online'];
+    private const ALLOWED_CLIENT_IPS = ['127.0.0.1', '::1'];
 
     public function __construct(private readonly HttpClientInterface $httpClient)
     {
@@ -25,14 +27,19 @@ class ProxyController extends AbstractController
     #[Route('/api/request', name: 'api_request', methods: ['POST', 'OPTIONS'])]
     public function __invoke(Request $request): Response
     {
+        if (!$this->isRequestFromAllowedSource($request)) {
+            // no CORS headers on purpose - the browser must not be able to read this either
+            return new Response('', Response::HTTP_FORBIDDEN);
+        }
+
         if ($request->getMethod() === 'OPTIONS') {
-            return $this->withCors(new Response('', Response::HTTP_NO_CONTENT));
+            return $this->withCors($request, new Response('', Response::HTTP_NO_CONTENT));
         }
 
         $payload = json_decode($request->getContent(), true);
 
         if (!is_array($payload)) {
-            return $this->withCors($this->error('Invalid JSON payload', 400));
+            return $this->withCors($request, $this->error('Invalid JSON payload', 400));
         }
 
         $method = strtoupper((string) ($payload['method'] ?? 'GET'));
@@ -41,17 +48,17 @@ class ProxyController extends AbstractController
         $body = $payload['body'] ?? null;
 
         if (!in_array($method, self::ALLOWED_METHODS, true)) {
-            return $this->withCors($this->error("Unsupported method: {$method}", 400));
+            return $this->withCors($request, $this->error("Unsupported method: {$method}", 400));
         }
 
         if ($body !== null && strlen((string) $body) > self::MAX_REQUEST_BODY_BYTES) {
-            return $this->withCors($this->error('Request body too large', 413));
+            return $this->withCors($request, $this->error('Request body too large', 413));
         }
 
         $resolution = $this->resolveTarget($url);
 
         if ($resolution['error'] !== null) {
-            return $this->withCors($this->error($resolution['error'], 400));
+            return $this->withCors($request, $this->error($resolution['error'], 400));
         }
 
         $outgoingHeaders = [];
@@ -99,18 +106,18 @@ class ProxyController extends AbstractController
             $declaredLength = (int) ($responseHeaders['content-length'] ?? 0);
 
             if ($declaredLength > self::MAX_RESPONSE_BYTES) {
-                return $this->withCors($this->error('Response body too large', 502));
+                return $this->withCors($request, $this->error('Response body too large', 502));
             }
 
             $content = $response->getContent(false);
 
             if (strlen($content) > self::MAX_RESPONSE_BYTES) {
-                return $this->withCors($this->error('Response body too large', 502));
+                return $this->withCors($request, $this->error('Response body too large', 502));
             }
 
             $time = (int) round((microtime(true) - $start) * 1000);
 
-            return $this->withCors($this->json([
+            return $this->withCors($request, $this->json([
                 'ok' => $status >= 200 && $status < 300,
                 'status' => $status,
                 'statusText' => $this->extractStatusText($response),
@@ -119,9 +126,9 @@ class ProxyController extends AbstractController
                 'time' => $time,
             ]));
         } catch (TransportExceptionInterface $e) {
-            return $this->withCors($this->error('Request failed: ' . $e->getMessage(), 502));
+            return $this->withCors($request, $this->error('Request failed: ' . $e->getMessage(), 502));
         } catch (\Throwable $e) {
-            return $this->withCors($this->error('Request failed: ' . $e->getMessage(), 502));
+            return $this->withCors($request, $this->error('Request failed: ' . $e->getMessage(), 502));
         }
     }
 
@@ -223,9 +230,50 @@ class ProxyController extends AbstractController
         return $this->json(['error' => $message], $status);
     }
 
-    private function withCors(Response $response): Response
+    /**
+     * Restricts who may call this proxy at all: same-machine callers (127.0.0.1 - the
+     * local Symfony server during frontend dev, or manual curl testing on the server
+     * itself) plus browser requests whose Origin is the real frontend. This is separate
+     * from resolveTarget()'s SSRF checks, which validate the URL being proxied TO, not
+     * who's allowed to ask for the proxying in the first place.
+     *
+     * Note this only stops casual/browser-based abuse: a non-browser client can still
+     * fake an Origin header freely, since nothing here is a secret the caller must prove
+     * knowledge of. Treat it as a courtesy gate, not real authentication.
+     */
+    private function isRequestFromAllowedSource(Request $request): bool
     {
-        $response->headers->set('Access-Control-Allow-Origin', '*');
+        $clientIp = $request->getClientIp();
+
+        if ($clientIp !== null && in_array($clientIp, self::ALLOWED_CLIENT_IPS, true)) {
+            return true;
+        }
+
+        return $this->matchedOrigin($request) !== null;
+    }
+
+    private function matchedOrigin(Request $request): ?string
+    {
+        $origin = $request->headers->get('Origin');
+
+        if ($origin === null) {
+            return null;
+        }
+
+        $origin = rtrim($origin, '/');
+
+        return in_array($origin, self::ALLOWED_ORIGINS, true) ? $origin : null;
+    }
+
+    private function withCors(Request $request, Response $response): Response
+    {
+        $origin = $this->matchedOrigin($request);
+
+        if ($origin !== null) {
+            $response->headers->set('Access-Control-Allow-Origin', $origin);
+            $response->headers->set('Vary', 'Origin');
+        }
+
         $response->headers->set('Access-Control-Allow-Methods', 'POST, OPTIONS');
         $response->headers->set('Access-Control-Allow-Headers', 'Content-Type');
         $response->headers->set('Access-Control-Max-Age', '86400');
