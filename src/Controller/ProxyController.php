@@ -48,10 +48,10 @@ class ProxyController extends AbstractController
             return $this->withCors($this->error('Request body too large', 413));
         }
 
-        $validationError = $this->validateTargetUrl($url);
+        $resolution = $this->resolveTarget($url);
 
-        if ($validationError !== null) {
-            return $this->withCors($this->error($validationError, 400));
+        if ($resolution['error'] !== null) {
+            return $this->withCors($this->error($resolution['error'], 400));
         }
 
         $outgoingHeaders = [];
@@ -67,8 +67,16 @@ class ProxyController extends AbstractController
         $options = [
             'headers' => $outgoingHeaders,
             'timeout' => self::TIMEOUT_SECONDS,
-            'max_redirects' => 5,
+            // redirects are not auto-followed: a redirect target hasn't been through
+            // resolveTarget() yet and could point straight at an internal address
+            'max_redirects' => 0,
         ];
+
+        // pin the connection to the exact IP we just validated, so a second DNS lookup
+        // performed by the HTTP client itself (DNS rebinding) can't bypass that check
+        if (!filter_var($resolution['host'], FILTER_VALIDATE_IP)) {
+            $options['resolve'] = [$resolution['host'] => $resolution['ip']];
+        }
 
         if ($body !== null && !in_array($method, ['GET', 'HEAD'], true)) {
             $options['body'] = (string) $body;
@@ -79,21 +87,25 @@ class ProxyController extends AbstractController
         try {
             $response = $this->httpClient->request($method, $url, $options);
 
-            $content = '';
-
-            foreach ($this->httpClient->stream($response, self::TIMEOUT_SECONDS) as $chunk) {
-                $content .= $chunk->getContent();
-
-                if (strlen($content) > self::MAX_RESPONSE_BYTES) {
-                    throw new \RuntimeException('Response body exceeds the ' . self::MAX_RESPONSE_BYTES . ' byte limit');
-                }
-            }
-
+            // getStatusCode()/getHeaders(false) never throw, regardless of a 4xx/5xx status -
+            // this proxy must hand back error responses too, not just successful ones
             $status = $response->getStatusCode();
 
             $responseHeaders = [];
             foreach ($response->getHeaders(false) as $name => $values) {
                 $responseHeaders[$name] = implode(', ', $values);
+            }
+
+            $declaredLength = (int) ($responseHeaders['content-length'] ?? 0);
+
+            if ($declaredLength > self::MAX_RESPONSE_BYTES) {
+                return $this->withCors($this->error('Response body too large', 502));
+            }
+
+            $content = $response->getContent(false);
+
+            if (strlen($content) > self::MAX_RESPONSE_BYTES) {
+                return $this->withCors($this->error('Response body too large', 502));
             }
 
             $time = (int) round((microtime(true) - $start) * 1000);
@@ -127,9 +139,13 @@ class ProxyController extends AbstractController
             $rawHeaders = $response->getInfo('response_headers') ?? [];
             $statusLine = trim($rawHeaders[0] ?? '');
 
-            // HTTP/2 and HTTP/3 responses carry no reason phrase - fall back to a standard lookup
-            if (preg_match('#^HTTP/\S+\s+\d+\s*(.+)$#i', $statusLine, $matches)) {
-                return trim($matches[1]);
+            // "HTTP/1.1 404 Not Found" -> ["HTTP/1.1", "404", "Not Found"]; limit 3 keeps a
+            // multi-word phrase intact. HTTP/2 and HTTP/3 responses carry no reason phrase at
+            // all, so this simply won't have a 3rd part and falls through to the lookup below.
+            $parts = preg_split('/\s+/', $statusLine, 3);
+
+            if (isset($parts[2]) && $parts[2] !== '') {
+                return $parts[2];
             }
         } catch (\Throwable $e) {
             // ignore - statusText is a cosmetic extra, never worth failing the request over
@@ -138,26 +154,29 @@ class ProxyController extends AbstractController
         return self::REASON_PHRASES[$response->getStatusCode()] ?? '';
     }
 
-    private function validateTargetUrl(string $url): ?string
+    /**
+     * @return array{error: ?string, host: ?string, ip: ?string}
+     */
+    private function resolveTarget(string $url): array
     {
         if ($url === '') {
-            return 'URL is required';
+            return ['error' => 'URL is required', 'host' => null, 'ip' => null];
         }
 
         $parts = parse_url($url);
 
         if ($parts === false || empty($parts['scheme']) || empty($parts['host'])) {
-            return 'Invalid URL';
+            return ['error' => 'Invalid URL', 'host' => null, 'ip' => null];
         }
 
         if (!in_array(strtolower($parts['scheme']), ['http', 'https'], true)) {
-            return 'Only http and https URLs are allowed';
+            return ['error' => 'Only http and https URLs are allowed', 'host' => null, 'ip' => null];
         }
 
         $host = $parts['host'];
 
         if (strtolower($host) === 'localhost') {
-            return 'Requests to local addresses are not allowed';
+            return ['error' => 'Requests to local addresses are not allowed', 'host' => null, 'ip' => null];
         }
 
         if (filter_var($host, FILTER_VALIDATE_IP)) {
@@ -165,20 +184,27 @@ class ProxyController extends AbstractController
         } else {
             $resolved = gethostbynamel($host);
 
-            if ($resolved === false) {
-                return 'Could not resolve host';
+            if ($resolved === false || $resolved === []) {
+                return ['error' => 'Could not resolve host', 'host' => null, 'ip' => null];
             }
 
             $ips = $resolved;
         }
 
+        $publicIp = null;
+
         foreach ($ips as $ip) {
-            if ($this->isForbiddenIp($ip)) {
-                return 'Requests to private or internal addresses are not allowed';
+            if (!$this->isForbiddenIp($ip)) {
+                $publicIp = $ip;
+                break;
             }
         }
 
-        return null;
+        if ($publicIp === null) {
+            return ['error' => 'Requests to private or internal addresses are not allowed', 'host' => null, 'ip' => null];
+        }
+
+        return ['error' => null, 'host' => $host, 'ip' => $publicIp];
     }
 
     private function isForbiddenIp(string $ip): bool
