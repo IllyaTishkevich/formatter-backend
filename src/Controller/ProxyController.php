@@ -2,6 +2,7 @@
 
 namespace App\Controller;
 
+use App\Security\ApiAccessGuard;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -17,17 +18,17 @@ class ProxyController extends AbstractController
     private const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024;
     private const TIMEOUT_SECONDS = 15.0;
     private const FORBIDDEN_REQUEST_HEADERS = ['host', 'content-length', 'connection'];
-    private const ALLOWED_ORIGINS = ['https://validformat.online'];
-    private const ALLOWED_CLIENT_IPS = ['127.0.0.1', '::1'];
 
-    public function __construct(private readonly HttpClientInterface $httpClient)
-    {
+    public function __construct(
+        private readonly HttpClientInterface $httpClient,
+        private readonly ApiAccessGuard $accessGuard,
+    ) {
     }
 
     #[Route('/api/request', name: 'api_request', methods: ['POST', 'OPTIONS'])]
     public function __invoke(Request $request): Response
     {
-        if (!$this->isRequestFromAllowedSource($request)) {
+        if (!$this->accessGuard->isRequestAllowed($request)) {
             // no CORS headers on purpose - the browser must not be able to read this either
             return new Response('', Response::HTTP_FORBIDDEN);
         }
@@ -230,54 +231,8 @@ class ProxyController extends AbstractController
         return $this->json(['error' => $message], $status);
     }
 
-    /**
-     * Restricts who may call this proxy at all: same-machine callers (127.0.0.1 - the
-     * local Symfony server during frontend dev, or manual curl testing on the server
-     * itself) plus browser requests whose Origin is the real frontend. This is separate
-     * from resolveTarget()'s SSRF checks, which validate the URL being proxied TO, not
-     * who's allowed to ask for the proxying in the first place.
-     *
-     * Note this only stops casual/browser-based abuse: a non-browser client can still
-     * fake an Origin header freely, since nothing here is a secret the caller must prove
-     * knowledge of. Treat it as a courtesy gate, not real authentication.
-     */
-    private function isRequestFromAllowedSource(Request $request): bool
-    {
-        $clientIp = $request->getClientIp();
-
-        if ($clientIp !== null && in_array($clientIp, self::ALLOWED_CLIENT_IPS, true)) {
-            return true;
-        }
-
-        return $this->matchedOrigin($request) !== null;
-    }
-
-    private function matchedOrigin(Request $request): ?string
-    {
-        $origin = $request->headers->get('Origin');
-
-        if ($origin === null) {
-            return null;
-        }
-
-        $origin = rtrim($origin, '/');
-
-        return in_array($origin, self::ALLOWED_ORIGINS, true) ? $origin : null;
-    }
-
     private function withCors(Request $request, Response $response): Response
     {
-        $origin = $this->matchedOrigin($request);
-
-        if ($origin !== null) {
-            $response->headers->set('Access-Control-Allow-Origin', $origin);
-            $response->headers->set('Vary', 'Origin');
-        }
-
-        $response->headers->set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-        $response->headers->set('Access-Control-Allow-Headers', 'Content-Type');
-        $response->headers->set('Access-Control-Max-Age', '86400');
-
-        return $response;
+        return $this->accessGuard->withCors($request, $response, 'POST, OPTIONS');
     }
 }
