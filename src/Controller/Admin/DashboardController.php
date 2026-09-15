@@ -2,8 +2,6 @@
 
 namespace App\Controller\Admin;
 
-use App\Entity\BlockCheck;
-use App\Entity\User;
 use EasyCorp\Bundle\EasyAdminBundle\Config\Dashboard;
 use EasyCorp\Bundle\EasyAdminBundle\Config\MenuItem;
 use EasyCorp\Bundle\EasyAdminBundle\Controller\AbstractDashboardController;
@@ -30,8 +28,8 @@ class DashboardController extends AbstractDashboardController
     public function configureMenuItems(): iterable
     {
         yield MenuItem::linkToDashboard('Dashboard', 'fa fa-home');
-        yield MenuItem::linkTo(User::class, 'Users', 'fa fa-users');
-        yield MenuItem::linkTo(BlockCheck::class, 'Block checks', 'fa fa-shield-alt');
+        yield MenuItem::linkTo(UserCrudController::class, 'Users', 'fa fa-users');
+        yield MenuItem::linkTo(BlockCheckCrudController::class, 'Block checks', 'fa fa-shield-alt');
     }
 
     public static function getSubscribedServices(): array
