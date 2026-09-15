@@ -11,7 +11,7 @@ use Symfony\Component\HttpFoundation\Request;
 class RequestInspector
 {
     // never reflect these back, even to the same client that sent them
-    private const EXCLUDED_HEADERS = ['cookie', 'authorization', 'host', 'referer'];
+    private const EXCLUDED_HEADERS = ['cookie', 'authorization', 'host', 'referer', 'origin'];
 
     /**
      * @return array<string, mixed>
