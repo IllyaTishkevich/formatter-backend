@@ -11,7 +11,7 @@ use Symfony\Component\Routing\Annotation\Route;
 class IpController extends AbstractController
 {
     // never reflect these back, even to the same client that sent them
-    private const EXCLUDED_HEADERS = ['cookie', 'authorization'];
+    private const EXCLUDED_HEADERS = ['cookie', 'authorization', 'host'];
 
     public function __construct(private readonly ApiAccessGuard $accessGuard)
     {
@@ -61,9 +61,6 @@ class IpController extends AbstractController
             'preferredLanguages' => $request->getLanguages(),
             'acceptEncoding' => $headers->get('Accept-Encoding'),
             'dnt' => $headers->get('DNT'),
-            'referer' => $headers->get('Referer'),
-            'origin' => $headers->get('Origin'),
-            'host' => $request->getHost(),
             'port' => $request->getPort(),
             'scheme' => $request->getScheme(),
             'secure' => $request->isSecure(),
